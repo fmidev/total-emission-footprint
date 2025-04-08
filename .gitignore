@@ -1,0 +1,11 @@
+*.pyc
+*~*
+*#*
+*.#*
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*jupyter.*out*
+.ipynb
+*DS_Store
+*.png
+*.xlsx
