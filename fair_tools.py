@@ -14,6 +14,7 @@ import os
 import netCDF4
 import xarray as xr
 from pathlib import Path
+import warnings
 
 
 load_dotenv()
@@ -39,7 +40,10 @@ non_co2_ghgs=['CH4', 'N2O', 'CFC-11', 'CFC-12', 'CFC-113', 'CFC-114',
        'HFC-143a', 'HFC-152a', 'HFC-227ea', 'HFC-23', 'HFC-236fa', 'HFC-245fa',
        'HFC-32', 'HFC-365mfc', 'HFC-4310mee']
 
+datadir=Path('/Users/partanen/OneDrive - Ilmatieteen laitos/projects/ghgbudgets/data')
+fair_calibration_dir=datadir / 'fair_calibrate'
 
+    
 def createConstrainedRuns(scenarios=['ssp119'], year_end=2051, forcings={'non-ghg':True, 'non-co2-ghgs':True}):
     '''
     Based on the script:
@@ -57,8 +61,7 @@ def createConstrainedRuns(scenarios=['ssp119'], year_end=2051, forcings={'non-gh
         DESCRIPTION.
     
     '''
-    datadir=Path('/Users/partanen/OneDrive - Ilmatieteen laitos/projects/ghgbudgets/data')
-    fair_calibration_dir=datadir / 'fair_calibrate'
+
     #fair_calibration_dir=Path('/Users/partanen/Library/CloudStorage/OneDrive-Ilmatieteenlaitos/projects/FaIR-MCMC/fair-calibrate')
     
     df_solar = pd.read_csv(
@@ -494,40 +497,118 @@ def update_scenario_names(f, scenario_map):
 
     return f
 
-def calculate_natural_sinks(fair_instance, specie='CO2', reference_year=2024):
-    """
-    Calculate annual natural sinks for all scenarios in a given specie
-    based on cumulative emissions and airborne fraction.
 
-    Parameters:
-    fair_instance : xarray.Dataset
-        The FaIR instance containing airborne fraction and cumulative emissions.
-    specie : str, optional
-        The specie (e.g., 'CO2') for which to calculate natural sinks. Default is 'CO2'.
+def run_1pctco2():
+    scenarios = ["1pctCO2"]
+    # batch_start = cfg["batch_start"]
+    # batch_end = cfg["batch_end"]
+    # batch_size = batch_end - batch_start
 
-    Returns:
-    annual_natural_sinks : xarray.DataArray
-        The annual natural sinks calculated by differencing cumulative sinks for all scenarios.
-    """
-    # Select cumulative emissions and airborne fraction for the specified specie across all scenarios
-    airborne_fraction = fair_instance.airborne_fraction.sel(specie=specie)
-    cumulative_emissions = fair_instance.cumulative_emissions.sel(specie=specie)
-
-
-    # Calculate cumulative natural sinks for all scenarios
-    cumulative_natural_sinks = cumulative_emissions * (1 - airborne_fraction)
-
-    # Compute annual natural sinks by differencing the cumulative values along the timebounds dimension
-    annual_natural_sinks = cumulative_natural_sinks.diff(dim='timebounds')
-
-    # Drop NaN values (for the first time bound)
-    annual_natural_sinks = -annual_natural_sinks.dropna(dim='timebounds', how='all')
-    cumulative_natural_sinks = -cumulative_natural_sinks.dropna(dim='timebounds', how='all')
+    df_configs = pd.read_csv(
+        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/posteriors/'
+        'calibrated_constrained_parameters.csv',
+        index_col=0,
+    )
     
-    # Adjust cumulative natural sinks to zero at reference year
-    if reference_year is not None:
-        cumulative_natural_sinks=cumulative_natural_sinks-cumulative_natural_sinks.sel(timebounds=reference_year)
-        
+    species, properties = read_properties()
 
+    da_concentration = xr.load_dataarray(
+        f"{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/"
+        "concentration/1pctCO2_concentration_1850-1990.nc"
+    )
 
-    return annual_natural_sinks, cumulative_natural_sinks
+    f = FAIR()
+    f.define_time(1850, 1990, 1)
+    f.define_scenarios(scenarios)
+    species = ["CO2", "CH4", "N2O"]
+    properties = {
+        "CO2": {
+            "type": "co2",
+            "input_mode": "concentration",
+            "greenhouse_gas": True,
+            "aerosol_chemistry_from_emissions": False,
+            "aerosol_chemistry_from_concentration": False,
+        },
+        "CH4": {
+            "type": "ch4",
+            "input_mode": "concentration",
+            "greenhouse_gas": True,
+            "aerosol_chemistry_from_emissions": False,
+            "aerosol_chemistry_from_concentration": False,
+        },
+        "N2O": {
+            "type": "n2o",
+            "input_mode": "concentration",
+            "greenhouse_gas": True,
+            "aerosol_chemistry_from_emissions": False,
+            "aerosol_chemistry_from_concentration": False,
+        },
+    }
+    valid_all = df_configs.index
+    f.define_configs(valid_all)
+    f.define_species(species, properties)
+    f.allocate()
+
+    da = da_concentration.loc[dict(config="unspecified", scenario="1pctCO2")]
+    fe = da.expand_dims(dim=["scenario", "config"], axis=(1, 2))
+    f.concentration = fe.drop("config") * np.ones((1, 1, len(valid_all), 1))
+
+    # climate response
+    fill(
+        f.climate_configs["ocean_heat_capacity"],
+        np.array([df_configs["clim_c1"], df_configs["clim_c2"], df_configs["clim_c3"]]).T,
+    )
+    fill(
+        f.climate_configs["ocean_heat_transfer"],
+        np.array([df_configs["clim_kappa1"], df_configs["clim_kappa2"], df_configs["clim_kappa3"]]).T,
+    )
+    fill(f.climate_configs["deep_ocean_efficacy"], df_configs["clim_epsilon"])
+    fill(f.climate_configs["gamma_autocorrelation"], df_configs["clim_gamma"])
+    fill(f.climate_configs["stochastic_run"], False)
+    fill(f.climate_configs["forcing_4co2"], df_configs["clim_F_4xCO2"])
+
+    # species level
+    f.fill_species_configs()
+
+    # carbon cycle
+    fill(f.species_configs["iirf_0"], df_configs["cc_r0"].values.squeeze(), specie="CO2")
+    fill(
+        f.species_configs["iirf_airborne"], df_configs["cc_rA"].values.squeeze(), specie="CO2"
+    )
+    fill(f.species_configs["iirf_uptake"], df_configs["cc_rU"].values.squeeze(), specie="CO2")
+    fill(
+        f.species_configs["iirf_temperature"],
+        df_configs["cc_rT"].values.squeeze(),
+        specie="CO2",
+    )
+
+    # forcing scaling
+    fill(f.species_configs["forcing_scale"], df_configs["fscale_CO2"], specie="CO2")
+    fill(f.species_configs["forcing_scale"], df_configs["fscale_CH4"], specie="CH4")
+    fill(f.species_configs["forcing_scale"], df_configs["fscale_N2O"], specie="N2O")
+
+    # initial conditions
+    initialise(f.forcing, 0)
+    initialise(f.temperature, 0)
+    initialise(f.cumulative_emissions, 0)
+    initialise(f.airborne_emissions, 0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        f.run(progress=False)
+
+    sat=f.temperature.sel(layer=0)
+    sat=sat.squeeze().drop_vars(['scenario','layer'])
+    
+    
+    cum_emi=f.cumulative_emissions.sel(specie='CO2')
+    cum_emi=cum_emi.squeeze().drop_vars(['scenario'])/3.67 # In Gt C
+    
+    tcre=sat.sel(timebounds=1920)/cum_emi.sel(timebounds=1920)*1000
+    tcr=sat.sel(timebounds=1920)
+
+    # Drop unnecessary dimensions
+    tcre=tcre.squeeze().drop_vars(['timebounds','specie'])
+    tcr=tcr.squeeze().drop_vars(['timebounds'])
+
+    return tcre,tcr, sat, cum_emi
