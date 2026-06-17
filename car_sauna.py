@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Thu Mar  5 14:52:07 2026
+Helpers for running FaIR baseline and scaled activity pulses.
 
-@author: Antti-Ilari Partanen (antti-ilari.partanen@fmi.fi)
+Created on Thu Mar 5 14:52:07 2026
+@author: Antti-Ilari Partanen
 """
 
 import warnings
 from typing import Dict, Optional, Tuple
 
-import numpy as np
 import xarray as xr
 
 from fair_tools import createConstrainedRuns, rebase_temperature
@@ -20,7 +20,7 @@ def run_baseline_fair(
     year_end: int = 2100,
     forcings: Optional[Dict[str, bool]] = None,
 ) -> Tuple[object, xr.DataArray]:
-    '''
+    """
     Run a baseline FaIR simulation for a given SSP scenario.
 
     Parameters
@@ -44,9 +44,9 @@ def run_baseline_fair(
     sat : xarray.DataArray
         Global mean surface air temperature (layer 0), rebased to
         1850–1900, with dimensions:
-            - 'timepoints'
+            - 'timebounds'
             - 'config'
-    '''
+    """
     if forcings is None:
         forcings = {'non-ghg': True, 'non-co2-ghgs': True}
 
@@ -62,9 +62,7 @@ def run_baseline_fair(
 
     f = rebase_temperature(f)
 
-    # Select global-mean SAT (layer 0) and drop scenario/layer coords
     sat = f.temperature.sel(layer=0)
-    # Remove scenario and layer coordinates if they exist
     drop_coords = [coord for coord in sat.coords if coord in ['scenario', 'layer']]
     if drop_coords:
         sat = sat.drop_vars(drop_coords)
@@ -72,22 +70,23 @@ def run_baseline_fair(
 
     return f, sat
 
+
 def _apply_activity_pulse(
     f: object,
-    year: int,
+    year: float,
     activity_emissions: Dict[str, float],
     scale_factor: float,
 ) -> None:
-    '''
-    Internal helper that modifies emissions in-place for one year.
+    """
+    Internal helper that modifies emissions in-place for one mid-year timepoint.
 
     Parameters
     ----------
     f : fair.fair.FAIR
         FaIR instance with emissions already set (from createConstrainedRuns).
-    year : int
-        Year in which to apply the emission pulse (must be in
-        f.emissions.timepoints).
+    year : float
+        Timepoint (e.g. 2026.5) at which to apply the emission pulse.
+        Must match a value in f.emissions.timepoints.
     activity_emissions : dict
         Dictionary mapping specie name (as used in FaIR) to emissions
         per single unit activity (e.g. per sauna session), in the same
@@ -96,14 +95,14 @@ def _apply_activity_pulse(
     scale_factor : float
         Scalar by which the activity_emissions are multiplied for the
         model run.
-    '''
+    """
     available_species = f.emissions.coords['specie'].values
-    available_years = f.emissions.coords['timepoints'].values
+    available_times = f.emissions.coords['timepoints'].values
 
-    if year not in available_years:
+    if year not in available_times:
         raise ValueError(
             f'Year {year} not in f.emissions.timepoints; '
-            f'available range is {available_years.min()}–{available_years.max()}'
+            f'available range is {available_times.min()}–{available_times.max()}'
         )
 
     for specie, emis in activity_emissions.items():
@@ -113,8 +112,6 @@ def _apply_activity_pulse(
                 f'Available species include: {list(available_species)}'
             )
 
-        # Add scaled emissions to all configs and the single scenario.
-        # Xarray will broadcast over 'config' and 'scenario' automatically.
         f.emissions.loc[dict(timepoints=year, specie=specie)] += emis * scale_factor
 
 
@@ -126,14 +123,17 @@ def run_scaled_activity_pulse(
     year_end: int = 2100,
     scale_factor: float = 1e6,
     forcings: Optional[Dict[str, bool]] = None,
-) -> xr.Dataset:
-    '''
+    f_base: Optional[object] = None,
+    sat_base: Optional[xr.DataArray] = None,
+    return_fair: bool = False,
+):
+    """
     Run FaIR for a baseline and a scaled activity pulse, return per-unit response.
 
     This function:
-        1) runs a baseline simulation for the chosen SSP scenario;
-        2) runs a perturbed simulation with emissions in 'year' increased by
-           scale_factor * activity_emissions;
+        1) uses a baseline FaIR run (given or newly run) for the chosen SSP;
+        2) runs a perturbed simulation with emissions at mid-year 'year+0.5'
+           increased by scale_factor * activity_emissions;
         3) computes per-unit temperature response by dividing the difference
            by 'scale_factor'.
 
@@ -143,7 +143,8 @@ def run_scaled_activity_pulse(
         SSP scenario name used as the background (e.g. 'ssp245').
         Default is 'ssp245'.
     year : int, optional
-        Year in which the activity emissions are applied. Default is 2026.
+        Activity year (e.g. 2026). The pulse is applied at year+0.5.
+        Default is 2026.
     activity_emissions : dict
         Mapping from specie name (FaIR naming) to annual emissions per
         single unit of activity (e.g. one sauna activity). Units must be
@@ -162,6 +163,15 @@ def run_scaled_activity_pulse(
         Dictionary controlling non-GHG and non-CO2 GHG options, e.g.
         {'non-ghg': True, 'non-co2-ghgs': True}.
         If None, the defaults of createConstrainedRuns are used.
+    f_base : fair.fair.FAIR, optional
+        Pre-computed baseline FaIR instance (e.g. from run_baseline_fair).
+        If provided, this baseline is reused and not re-run.
+    sat_base : xarray.DataArray, optional
+        Baseline rebased SAT corresponding to f_base. If None and f_base
+        is provided, it is computed from f_base.temperature.
+    return_fair : bool, optional
+        If True, return also the FaIR perturbed instance. The return is
+        then (ds, f_pert). Default is False.
 
     Returns
     -------
@@ -170,26 +180,39 @@ def run_scaled_activity_pulse(
             - 'sat_baseline'      : baseline global SAT (rebased)
             - 'sat_perturbed'     : perturbed global SAT (rebased)
             - 'delta_sat_per_unit': (sat_perturbed - sat_baseline) / scale_factor
-
         All with dimensions:
-            - 'timepoints'
+            - 'timebounds'
             - 'config'
-
         And attributes:
             'activity', 'base_scenario', 'perturbation_year', 'scale_factor'.
-    '''
+
+    If return_fair is True:
+        (ds, f_pert)
+    """
     if activity_emissions is None:
         raise ValueError('activity_emissions must be provided.')
 
     if forcings is None:
         forcings = {'non-ghg': True, 'non-co2-ghgs': True}
 
-    # 1. Baseline run
-    _, sat_base = run_baseline_fair(
-        base_scenario=base_scenario,
-        year_end=year_end,
-        forcings=forcings,
-    )
+    # 1. Baseline: reuse if provided, otherwise run a new one
+    if f_base is None:
+        f_base, sat_base_local = run_baseline_fair(
+            base_scenario=base_scenario,
+            year_end=year_end,
+            forcings=forcings,
+        )
+        sat_base = sat_base_local
+    else:
+        if sat_base is None:
+            sat_base = f_base.temperature.sel(layer=0)
+            drop_coords = [
+                coord for coord in sat_base.coords
+                if coord in ['scenario', 'layer']
+            ]
+            if drop_coords:
+                sat_base = sat_base.drop_vars(drop_coords)
+            sat_base = sat_base.squeeze()
 
     # 2. Perturbed run: new FaIR instance to avoid side-effects
     f_pert = createConstrainedRuns(
@@ -200,7 +223,7 @@ def run_scaled_activity_pulse(
 
     _apply_activity_pulse(
         f=f_pert,
-        year=year+0.5,
+        year=year + 0.5,  # mid-year timepoint for emissions
         activity_emissions=activity_emissions,
         scale_factor=scale_factor,
     )
@@ -216,7 +239,7 @@ def run_scaled_activity_pulse(
         sat_pert = sat_pert.drop_vars(drop_coords)
     sat_pert = sat_pert.squeeze()
 
-    # 3. Per-unit temperature response
+    # 3. Per-unit temperature response (both on 'timebounds')
     delta_sat = (sat_pert - sat_base) / scale_factor
 
     # Add metadata
@@ -250,62 +273,7 @@ def run_scaled_activity_pulse(
         }
     )
 
+    if return_fair:
+        return ds, f_pert
+
     return ds
-
-
-def run_activity_scenarios(
-    base_scenario: str = 'ssp245',
-    year: int = 2026,
-    scenarios: Dict[str, Dict[str, float]] = None,
-    year_end: int = 2100,
-    scale_factor: float = 1e6,
-    forcings: Optional[Dict[str, bool]] = None,
-) -> Dict[str, xr.Dataset]:
-    '''
-    Run multiple activity scenarios and return per-unit responses.
-
-    Parameters
-    ----------
-    base_scenario : str, optional
-        SSP background scenario (e.g. 'ssp245'). Default is 'ssp245'.
-    year : int, optional
-        Year in which all activities are applied. Default is 2026.
-    scenarios : dict
-        Dictionary mapping scenario name to 'activity_emissions' dict, e.g.:
-            {
-                'city_sauna': {...},
-                'cottage_sauna': {...},
-            }
-        Each inner dict maps specie -> emissions per unit activity.
-    year_end : int, optional
-        Last simulation year. Default is 2100.
-    scale_factor : float, optional
-        Scale factor for all scenarios. Default is 1e6.
-    forcings : dict, optional
-        Forcing options passed to createConstrainedRuns. If None, defaults
-        of createConstrainedRuns are used.
-
-    Returns
-    -------
-    results : dict
-        Mapping from scenario name to xarray.Dataset as returned by
-        run_scaled_activity_pulse.
-    '''
-    if scenarios is None:
-        raise ValueError('scenarios dictionary must be provided.')
-
-    results: Dict[str, xr.Dataset] = {}
-
-    for name, activity_emissions in scenarios.items():
-        ds = run_scaled_activity_pulse(
-            base_scenario=base_scenario,
-            year=year,
-            activity_emissions=activity_emissions,
-            activity_label=name,
-            year_end=year_end,
-            scale_factor=scale_factor,
-            forcings=forcings,
-        )
-        results[name] = ds
-
-    return results
