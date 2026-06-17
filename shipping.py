@@ -150,3 +150,60 @@ ax3.set_xlabel('Cumulative CO$_2$ emissions (Gt C)')
 ax3.set_ylabel('Temperature change (°C)')
 fig3.savefig(figpath / 'cum_emi_temperature.png', dpi=150)
 
+# %%  Exact (per-ensemble-member) vs shortcut CO2-equivalent emissions
+# Shortcut (used for fig1's secondary axis above): divide the ensemble-MEAN
+# temperature response by the ensemble-MEAN TCRE (a single scalar). This
+# implicitly assumes TCRE and the temperature response are uncorrelated
+# across configs, which need not hold since both are driven by the same
+# per-config climate sensitivity (high-TCRE configs also warm faster).
+# Exact: divide each config's own temperature response by that config's own
+# TCRE first, then average over configs -- the same approach already used
+# for the gtp table above, here extended to the full time series.
+co2_equiv_continuous_shortcut = dsat_continuous.mean(dim='config') / tcre_mean
+co2_equiv_continuous_exact = (dsat_continuous / tcre).mean(dim='config')
+
+co2_equiv_1yr_shortcut = dsat_1yr.mean(dim='config') / tcre_mean
+co2_equiv_1yr_exact = (dsat_1yr / tcre).mean(dim='config')
+
+# Order-of-magnitude sanity check at one timestep
+example_year = 2070
+exact_val = float(co2_equiv_continuous_exact.sel(timebounds=example_year))
+shortcut_val = float(co2_equiv_continuous_shortcut.sel(timebounds=example_year))
+print(f'At {example_year}, Continuous scenario: exact={exact_val:.4g} GtCO2, '
+      f'shortcut={shortcut_val:.4g} GtCO2, '
+      f'diff={100*(shortcut_val-exact_val)/exact_val:.2f}%')
+
+fig4, ax4 = pl.subplots(1, 1, figsize=(6, 5))
+co2_equiv_continuous_exact.plot(ax=ax4, label='Continuous (exact)')
+co2_equiv_continuous_shortcut.plot(ax=ax4, label='Continuous (shortcut)', linestyle='--')
+co2_equiv_1yr_exact.plot(ax=ax4, label='1-year (exact)')
+co2_equiv_1yr_shortcut.plot(ax=ax4, label='1-year (shortcut)', linestyle='--')
+ax4.set_xlim((2020, year_end))
+ax4.legend()
+ax4.set_title('CO$_2$-equivalent emissions of IMO regulation\nexact (per-member TCRE) vs shortcut (mean TCRE)')
+ax4.set_xlabel('Year')
+ax4.set_ylabel('Cumulative CO$_2$-equivalent emissions (GtCO$_2$)')
+fig4.savefig(figpath / 'gtp_exact_vs_shortcut_timeseries.png', dpi=150)
+
+# %%  Scatter: shortcut vs exact CO2-equivalent emissions, one point per year
+fig5, ax5 = pl.subplots(1, 1, figsize=(5, 5))
+sel_years = slice(2020, year_end)
+ax5.scatter(co2_equiv_continuous_shortcut.sel(timebounds=sel_years),
+            co2_equiv_continuous_exact.sel(timebounds=sel_years),
+            s=8, alpha=0.5, label='Continuous')
+ax5.scatter(co2_equiv_1yr_shortcut.sel(timebounds=sel_years),
+            co2_equiv_1yr_exact.sel(timebounds=sel_years),
+            s=8, alpha=0.5, label='1-year')
+
+lo = min(ax5.get_xlim()[0], ax5.get_ylim()[0])
+hi = max(ax5.get_xlim()[1], ax5.get_ylim()[1])
+ax5.plot([lo, hi], [lo, hi], 'k--', lw=1, label='1:1')
+ax5.set_xlim((lo, hi))
+ax5.set_ylim((lo, hi))
+ax5.set_aspect('equal')
+ax5.set_xlabel('Shortcut: mean(ΔT) / mean(TCRE)  (GtCO$_2$)')
+ax5.set_ylabel('Exact: mean(ΔT / TCRE)  (GtCO$_2$)')
+ax5.set_title('CO$_2$-equivalent emissions:\nshortcut vs exact per-member calculation')
+ax5.legend()
+fig5.savefig(figpath / 'gtp_shortcut_vs_exact_scatter.png', dpi=150)
+
