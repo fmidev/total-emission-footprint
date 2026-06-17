@@ -3,6 +3,11 @@
 Created on Fri Jan  6 07:22:08 2023
 
 @author: Antti-Ilari Partanen (antti-ilari.partanen@fmi.fi)
+
+FaIR 2.2.4 / calibration v1.6.0. Ported from the ghgbudgets repo's
+fair_runs.py (createConstrainedRuns, rebase_temperature, calculate_timemean,
+_clip_emissions_to_baseline) and from livestock_methane's script_00_tcre.py
+(compute_tcre, lookup-based TCRE from the calibration's 1pctCO2 diagnostics).
 """
 import numpy as np
 import pandas as pd
@@ -11,7 +16,6 @@ from fair.io import read_properties
 from fair.interface import fill, initialise
 from dotenv import load_dotenv
 import os
-import netCDF4
 import xarray as xr
 from pathlib import Path
 import warnings
@@ -19,11 +23,9 @@ import warnings
 
 load_dotenv()
 
-cal_v = os.getenv('CALIBRATION_VERSION')
-fair_v = os.getenv('FAIR_VERSION')
-constraint_set = os.getenv('CONSTRAINT_SET')
 output_ensemble_size = int(os.getenv('POSTERIOR_SAMPLES'))
-plots = os.getenv('PLOTS', 'False').lower() in ('true', '1', 't')
+
+fair_calibration_dir = Path(os.getenv('FAIR_CALIBRATION_DIR'))
 
 
 # Should 'Equivalent effective stratospheric chlorine' be included here?
@@ -40,431 +42,192 @@ non_co2_ghgs=['CH4', 'N2O', 'CFC-11', 'CFC-12', 'CFC-113', 'CFC-114',
        'HFC-143a', 'HFC-152a', 'HFC-227ea', 'HFC-23', 'HFC-236fa', 'HFC-245fa',
        'HFC-32', 'HFC-365mfc', 'HFC-4310mee']
 
-datadir=Path('/Users/partanen/OneDrive - Ilmatieteen laitos/projects/ghgbudgets/data')
-fair_calibration_dir=datadir / 'fair_calibrate'
 
-    
-def createConstrainedRuns(scenarios=['ssp119'], year_end=2051, forcings={'non-ghg':True, 'non-co2-ghgs':True}):
+def _clip_emissions_to_baseline(f, verbose=False):
+    """Clip non-CO2 GHG emissions to >= baseline_emissions in all scenarios.
+
+    Physical floor: step_concentration uses (emissions - baseline_emissions)
+    as the anthropogenic perturbation. Anything below baseline_emissions implies
+    human activity is suppressing natural sources, which is unphysical.
+
+    For F-gases baseline_emissions = 0, so this is a zero floor.
+    For CH4/N2O the floor is the pre-industrial natural emission rate.
+
+    The main practical trigger is CFC-115: the harmonized SSP file contains
+    negative values from 2024 onward as a harmonization artifact (RCMIP v5.1.0
+    assumes ~1.4 kt/yr at 2020; the CMIP7 historical record shows ~0 kt/yr by
+    2021-2022; aneris pulls the future trajectory below zero to reconcile them).
+    """
+    for sp in non_co2_ghgs:
+        floor = float(
+            f.species_configs['baseline_emissions'].sel(specie=sp).mean()
+        )
+        vals = f.emissions.sel(specie=sp)
+        below_floor = vals < floor
+        n_years = int(below_floor.any(dim=['scenario', 'config']).sum())
+        if n_years > 0:
+            if verbose:
+                min_val = float(vals.where(below_floor).min())
+                scen_names = [str(s) for s in f.emissions.scenario.values]
+                print(f'  Clipping {sp}: {n_years} year(s) below baseline floor '
+                      f'({floor:.4g}), min value {min_val:.4g}, set to floor '
+                      f'(scenarios: {scen_names})')
+            f.emissions.loc[dict(specie=sp)] = vals.clip(min=floor)
+
+
+def calculate_timemean(data_in, timebound_interval):
+    tb1, tb2 = timebound_interval
+
+    # number of time bounds: tb1 and tb2 are year-start integers, so +2 gives the
+    # count of annual endpoints (tb1, tb1+1, …, tb2, tb2+1)
+    n_tb = tb2 - tb1 + 2
+
+    # trapezoidal weights: 0.5 at ends, 1.0 in middle
+    weights = np.ones(n_tb)
+    weights[0] = weights[-1] = 0.5
+    weights /= weights.sum()
+
+    # select interval, note tb2+1 to include closing bound
+    data_sel = data_in.sel(timebounds=slice(tb1, tb2+1))
+
+    # align weights to timebounds
+    weight_da = xr.DataArray(weights, dims=['timebounds'], coords={'timebounds': data_sel['timebounds']})
+
+    # weighted mean
+    return (data_sel * weight_da).sum(dim='timebounds')
+
+
+def createConstrainedRuns(scenarios=['ssp119'], year_end=2051, forcings={'non-ghg':True, 'non-co2-ghgs':True}, verbose=False):
     '''
     Based on the script:
-        fair-calibrate/input/fair-2.1.3/v1.4/all-2022/constraining/05_constrained-ssp-projections.py 
-        (from 5a31144b58d6b9e2b23a845f68f73c7eda98701c)
-    
+        fair-calibrate/input/constraining/07_constrained-ssp-projections.py
+        (calibration v1.6.0, FaIR 2.2.4)
+
     Parameters
     ----------
-    scenarios : TYPE, optional
-        DESCRIPTION. The default is ['ssp119', 'ssp126', 'ssp245', 'ssp370', 'ssp434', 'ssp460', 'ssp534-over', 'ssp585'].
-    
+    scenarios : list of str
+        SSP scenario names present in the harmonized emissions NetCDF.
+
     Returns
     -------
-    f : TYPE
-        DESCRIPTION.
-    
+    f : FAIR
+        Configured but not yet run.
     '''
 
-    #fair_calibration_dir=Path('/Users/partanen/Library/CloudStorage/OneDrive-Ilmatieteenlaitos/projects/FaIR-MCMC/fair-calibrate')
-    
+    # Solar ERF: relative to 1850-2019 baseline (consistent with v1.6.0 calibration)
     df_solar = pd.read_csv(
-   fair_calibration_dir / 'data/forcing/solar_erf_timebounds.csv', index_col='year'
+        fair_calibration_dir / 'output' / 'forcing' / 'solar_forcing_timebounds_cmip7.csv',
+        index_col=0,
     )
+    # Volcanic ERF: relative to 1850-2021 baseline
     df_volcanic = pd.read_csv(
-        fair_calibration_dir / 'data/forcing/volcanic_ERF_1750-2101_timebounds.csv',
-        index_col='timebounds',
+        fair_calibration_dir / 'data' / 'forcing' / 'volcanic_forcing_timebounds_cmip7.csv',
+        index_col=0,
     )
-    
-    
-    nyears=year_end-1750+1
-    
 
-    solar_forcing = np.zeros(nyears)
+    nyears = year_end - 1750 + 1
+
+    solar_forcing = df_solar['solar_erf_rel_1850-2019'].loc[1750:year_end].values
     volcanic_forcing = np.zeros(nyears)
-    year_end_volcanic=min(2101,year_end)
-    volcanic_forcing[:year_end_volcanic-1750+1] = df_volcanic['erf'].loc[1750:year_end_volcanic].values
-    solar_forcing = df_solar['erf'].loc[1750:year_end].values
-    
-    df_methane = pd.read_csv(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/calibrations/'
-        'CH4_lifetime.csv',
-        index_col=0,
+    year_end_volcanic = min(2301, year_end)
+    volcanic_forcing[:year_end_volcanic - 1750 + 1] = (
+        df_volcanic['volcanic_erf_rel_1850-2021'].loc[1750:year_end_volcanic].values
     )
+
     df_configs = pd.read_csv(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/posteriors/'
-        'calibrated_constrained_parameters.csv',
+        fair_calibration_dir / 'output' / 'posteriors' / 'calibrated_constrained_parameters.csv',
         index_col=0,
     )
-    
-    df_landuse = pd.read_csv(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/calibrations/'
-        'landuse_scale_factor.csv',
-        index_col=0,
-    )
-    df_lapsi = pd.read_csv(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/calibrations/'
-        'lapsi_scale_factor.csv',
-        index_col=0,
-    )
+
     valid_all = df_configs.index
-    
-    trend_shape = np.ones(nyears)
-    trend_shape[:271] = np.linspace(0, 1, 271)
-    
+
     f = FAIR(ch4_method='Thornhill2021')
     f.define_time(1750, year_end, 1)
     f.define_scenarios(scenarios)
     f.define_configs(valid_all)
-    species, properties = read_properties()
-    species.remove('Halon-1202')
-    species.remove('NOx aviation')
-    species.remove('Contrails')
-    
-# if not 'non-CO2-ghgs' in forcings:
-#     for specie in non_co2_ghg_forcings:
-#         species.remove(specie)
-    
-    # if not forcings['non-ghg']:
-    #     for specie in non_ghg_forcings:
-    #         species.remove(specie)
-    
+
+    # FaIR 2.2: read_properties takes path to calibration-specific species CSV
+    species, properties = read_properties(
+        fair_calibration_dir / 'output' / 'posteriors' / 'species_configs_properties.csv'
+    )
+    species.remove('Irrigation')
+    # Land use forcing is derived from CO2 AFOLU cumulative emissions when active;
+    # switched to prescribed (filled with 0) when non-ghg forcings are suppressed.
+    if forcings['non-ghg']:
+        properties['Land use']['input_mode'] = 'calculated'
+    else:
+        properties['Land use']['input_mode'] = 'forcing'
+
     f.define_species(species, properties)
     f.allocate()
-    
-    # run with harmonized emissions
+
     da_emissions = xr.load_dataarray(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/emissions/'
-        'ssps_harmonized_1750-2499.nc'
+        fair_calibration_dir / 'output' / 'emissions' / 'ssps_harmonized_1750-2499.nc'
     )
-    
+
     da = da_emissions.loc[dict(config='unspecified', scenario=scenarios, specie=species)][:nyears-1, ...]
     fe = da.expand_dims(dim=['config'], axis=(2))
     f.emissions = fe.drop_vars('config') * np.ones((1, 1, output_ensemble_size, 1))
     f.emissions.coords['config'] = f.configs
-    
-    
+
     if forcings['non-ghg']:
-        # solar and volcanic forcing
         fill(
             f.forcing,
-            volcanic_forcing[:, None, None] * df_configs['fscale_Volcanic'].values.squeeze(),
+            volcanic_forcing[:, None, None] * df_configs['forcing_scale[Volcanic]'].values.squeeze(),
             specie='Volcanic',
         )
         fill(
             f.forcing,
-            solar_forcing[:, None, None] * df_configs['fscale_solar_amplitude'].values.squeeze()
-            + trend_shape[:, None, None] * df_configs['fscale_solar_trend'].values.squeeze(),
+            solar_forcing[:, None, None] * df_configs['forcing_scale[Solar]'].values.squeeze(),
             specie='Solar',
         )
     else:
-        # solar and volcanic forcing
-        fill(
-            f.forcing,
-            0.,
-            specie='Volcanic',
-        )
-        fill(
-            f.forcing,
-            0.,
-            specie='Solar',
-        )
-    
-    # climate response
-    fill(
-        f.climate_configs['ocean_heat_capacity'],
-        df_configs.loc[:, 'clim_c1':'clim_c3'].values,
-    )
-    fill(
-        f.climate_configs['ocean_heat_transfer'],
-        df_configs.loc[:, 'clim_kappa1':'clim_kappa3'].values,
-    )  # not massively robust, since relies on kappa1, kappa2, kappa3 being in adjacent cols
-    fill(
-        f.climate_configs['deep_ocean_efficacy'],
-        df_configs['clim_epsilon'].values.squeeze(),
-    )
-    fill(
-        f.climate_configs['gamma_autocorrelation'],
-        df_configs['clim_gamma'].values.squeeze(),
-    )
-    fill(f.climate_configs['sigma_eta'], df_configs['clim_sigma_eta'].values.squeeze())
-    fill(f.climate_configs['sigma_xi'], df_configs['clim_sigma_xi'].values.squeeze())
-    fill(f.climate_configs['seed'], df_configs['seed'])
-    fill(f.climate_configs['stochastic_run'], True)
-    fill(f.climate_configs['use_seed'], True)
-    fill(f.climate_configs['forcing_4co2'], df_configs['clim_F_4xCO2'])
-    
-    # species level
-    f.fill_species_configs()
-    
-    # carbon cycle
-    fill(f.species_configs['iirf_0'], df_configs['cc_r0'].values.squeeze(), specie='CO2')
-    fill(
-        f.species_configs['iirf_airborne'],
-        df_configs['cc_rA'].values.squeeze(),
-        specie='CO2',
-    )
-    fill(
-        f.species_configs['iirf_uptake'], df_configs['cc_rU'].values.squeeze(), specie='CO2'
-    )
-    fill(
-        f.species_configs['iirf_temperature'],
-        df_configs['cc_rT'].values.squeeze(),
-        specie='CO2',
-    )
-    
-    # correct land use scale factor term
-    fill(
-        f.species_configs['land_use_cumulative_emissions_to_forcing'],
-        df_landuse.loc['historical_best', 'CO2_AFOLU'],
-        specie='CO2 AFOLU',
-    )
-    
-    
-    # aerosol indirect
-    fill(f.species_configs['aci_scale'], df_configs['aci_beta'].values.squeeze())
-    fill(
-        f.species_configs['aci_shape'],
-        df_configs['aci_shape_so2'].values.squeeze(),
-        specie='Sulfur',
-    )
-    fill(
-        f.species_configs['aci_shape'],
-        df_configs['aci_shape_bc'].values.squeeze(),
-        specie='BC',
-    )
-    fill(
-        f.species_configs['aci_shape'],
-        df_configs['aci_shape_oc'].values.squeeze(),
-        specie='OC',
-    )
-    
-    # methane lifetime baseline and sensitivity
-    fill(
-        f.species_configs['unperturbed_lifetime'],
-        df_methane.loc['historical_best', 'base'],
-        specie='CH4',
-    )
-    fill(
-        f.species_configs['ch4_lifetime_chemical_sensitivity'],
-        df_methane.loc['historical_best', 'CH4'],
-        specie='CH4',
-    )
-    fill(
-        f.species_configs['ch4_lifetime_chemical_sensitivity'],
-        df_methane.loc['historical_best', 'N2O'],
-        specie='N2O',
-    )
-    fill(
-        f.species_configs['lifetime_temperature_sensitivity'],
-        df_methane.loc['historical_best', 'temp'],
-    )
-    
-        
+        fill(f.forcing, 0., specie='Volcanic')
+        fill(f.forcing, 0., specie='Solar')
+        fill(f.forcing, 0., specie='Land use')
 
-    fill(
-        f.species_configs['ch4_lifetime_chemical_sensitivity'],
-        df_methane.loc['historical_best', 'VOC'],
-        specie='VOC',
+    # FaIR 2.2: fill species defaults from calibration properties, then override
+    # with the full posterior parameter set (climate response, carbon cycle,
+    # aerosols, ozone, per-species forcing scales, etc.).  baseline_emissions,
+    # land_use_cumulative_emissions_to_forcing, and lapsi_radiative_efficiency
+    # all live in species_configs_properties.csv for v1.6.0 — no manual fill
+    # needed (matches reference 07_constrained-ssp-projections.py).
+    f.fill_species_configs(
+        fair_calibration_dir / 'output' / 'posteriors' / 'species_configs_properties.csv'
     )
-    fill(
-        f.species_configs['ch4_lifetime_chemical_sensitivity'],
-        df_methane.loc['historical_best', 'NOx'],
-        specie='NOx',
-    )
-    fill(
-        f.species_configs['ch4_lifetime_chemical_sensitivity'],
-        df_methane.loc['historical_best', 'HC'],
-        specie='Equivalent effective stratospheric chlorine',
-    )
-    # correct LAPSI scale factor term
-    fill(
-        f.species_configs['lapsi_radiative_efficiency'],
-        df_lapsi.loc['historical_best', 'BC'],
-        specie='BC',
-    )
-            
-    
-    
-    # emissions adjustments for N2O and CH4 (we don't want to make these defaults as people
-    # might wanna run pulse expts with these gases)
-    fill(f.species_configs['baseline_emissions'], 19.41683292, specie='NOx')
-    fill(f.species_configs['baseline_emissions'], 2.293964929, specie='Sulfur')
-    fill(f.species_configs['baseline_emissions'], 348.4549732, specie='CO')
-    fill(f.species_configs['baseline_emissions'], 60.62284009, specie='VOC')
-    fill(f.species_configs['baseline_emissions'], 2.096765609, specie='BC')
-    fill(f.species_configs['baseline_emissions'], 15.44571911, specie='OC')
-    fill(f.species_configs['baseline_emissions'], 6.656462698, specie='NH3')
-    fill(f.species_configs['baseline_emissions'], 38.246272, specie='CH4')
-    fill(f.species_configs['baseline_emissions'], 0.92661989, specie='N2O')
-    fill(f.species_configs['baseline_emissions'], 0.02129917, specie='CCl4')
-    fill(f.species_configs['baseline_emissions'], 202.7251231, specie='CHCl3')
-    fill(f.species_configs['baseline_emissions'], 211.0095537, specie='CH2Cl2')
-    fill(f.species_configs['baseline_emissions'], 4544.519056, specie='CH3Cl')
-    fill(f.species_configs['baseline_emissions'], 111.4920237, specie='CH3Br')
-    fill(f.species_configs['baseline_emissions'], 0.008146006, specie='Halon-1211')
-    fill(f.species_configs['baseline_emissions'], 0.000010554155, specie='SO2F2')
-    fill(f.species_configs['baseline_emissions'], 0, specie='CF4')
-    
-
-    # aerosol direct
-    for specie in [
-        'BC',
-        'CH4',
-        'N2O',
-        'NH3',
-        'NOx',
-        'OC',
-        'Sulfur',
-        'VOC',
-        'Equivalent effective stratospheric chlorine',
-    ]:
-        fill(
-            f.species_configs['erfari_radiative_efficiency'],
-            df_configs[f'ari_{specie}'],
-            specie=specie,
-        )
-    
-    # forcing scaling
-    fill(
-        f.species_configs['forcing_scale'],
-        df_configs['fscale_CO2'].values.squeeze(),
-        specie='CO2',
+    f.override_defaults(
+        fair_calibration_dir / 'output' / 'posteriors' / 'calibrated_constrained_parameters.csv'
     )
 
-    for specie in [
-        'CH4',
-        'N2O'
-    ]:
-        fill(
-            f.species_configs['forcing_scale'],
-            df_configs[f'fscale_{specie}'].values.squeeze(),
-            specie=specie,
-        )
-
-    for specie in [
-        'Stratospheric water vapour',
-        'Light absorbing particles on snow and ice'
-
-    ]:
-        fill(
-            f.species_configs['forcing_scale'],
-            df_configs[f'fscale_{specie}'].values.squeeze(),
-            specie=specie,
-        )
-    if forcings['non-ghg']:
-        fill(
-            f.species_configs['forcing_scale'],
-            df_configs['fscale_Land use'].values.squeeze(),
-            specie='Land use',
-        )
-    
-
-    for specie in [
-        'CFC-11',
-        'CFC-12',
-        'CFC-113',
-        'CFC-114',
-        'CFC-115',
-        'HCFC-22',
-        'HCFC-141b',
-        'HCFC-142b',
-        'CCl4',
-        'CHCl3',
-        'CH2Cl2',
-        'CH3Cl',
-        'CH3CCl3',
-        'CH3Br',
-        'Halon-1211',
-        'Halon-1301',
-        'Halon-2402',
-        'CF4',
-        'C2F6',
-        'C3F8',
-        'c-C4F8',
-        'C4F10',
-        'C5F12',
-        'C6F14',
-        'C7F16',
-        'C8F18',
-        'NF3',
-        'SF6',
-        'SO2F2',
-        'HFC-125',
-        'HFC-134a',
-        'HFC-143a',
-        'HFC-152a',
-        'HFC-227ea',
-        'HFC-23',
-        'HFC-236fa',
-        'HFC-245fa',
-        'HFC-32',
-        'HFC-365mfc',
-        'HFC-4310mee',
-    ]:
-        fill(
-            f.species_configs['forcing_scale'],
-            df_configs['fscale_minorGHG'].values.squeeze(),
-            specie=specie,
-        )
-
-    # ozone
-
-    for specie in [
-        'Equivalent effective stratospheric chlorine',
-        'CO',
-        'VOC',
-        'NOx',
-    ]:
-        fill(
-            f.species_configs['ozone_radiative_efficiency'],
-            df_configs[f'o3_{specie}'],
-            specie=specie,
-        )
-    for specie in [
-        'CH4',
-        'N2O'
-    ]:
-        fill(
-            f.species_configs['ozone_radiative_efficiency'],
-            df_configs[f'o3_{specie}'],
-            specie=specie,
-        )
-    
-    if forcings['non-ghg']:
-        # tune down volcanic efficacy
-        fill(f.species_configs['forcing_efficacy'], 0.6, specie='Volcanic')
-    
-    
-    # initial condition of CO2 concentration (but not baseline for forcing calculations)
-    fill(
-        f.species_configs['baseline_concentration'],
-        df_configs['cc_co2_concentration_1750'].values.squeeze(),
-        specie='CO2',
-    )
-    
     if not forcings['non-ghg']:
-        # Overwrite emissions for non-GHG emissions with baseline emissions
         for specie in non_ghg_species:
-            f.emissions.loc[dict(specie=specie)]=f.species_configs['baseline_emissions'].loc[dict(specie=specie)]
-    
+            f.emissions.loc[dict(specie=specie)] = (
+                f.species_configs['baseline_emissions'].loc[dict(specie=specie)])
     if not forcings['non-co2-ghgs']:
-        # Overwrite emissions for non-CO2 GHG emissions with baseline emissions
         for specie in non_co2_ghgs:
-            f.emissions.loc[dict(specie=specie)]=f.species_configs['baseline_emissions'].loc[dict(specie=specie)]
-    
-    # initial conditions
+            f.emissions.loc[dict(specie=specie)] = (
+                f.species_configs['baseline_emissions'].loc[dict(specie=specie)])
+
+    # Enforce physical floor: clip non-CO2 GHG emissions to >= baseline_emissions.
+    # Species_configs are fully populated above, so baseline values are available.
+    # The non-co2-ghgs override above (if active) already sets emissions to the
+    # baseline floor, so this call will be a no-op in that case.
+    _clip_emissions_to_baseline(f, verbose=verbose)
+
     initialise(f.concentration, f.species_configs['baseline_concentration'])
     initialise(f.forcing, 0)
     initialise(f.temperature, 0)
     initialise(f.cumulative_emissions, 0)
     initialise(f.airborne_emissions, 0)
-    
+
     return f
-
-
 
 
 # Readjust temperatures to be relative to 1850-1900
 def rebase_temperature(f):
-   f.temperature=f.temperature-f.temperature.sel(timebounds=slice(1850,1900)).mean(dim='timebounds') 
+   f.temperature = f.temperature - calculate_timemean(f.temperature, [1850, 1900])
    return f
+
 
 def update_scenario_names(f, scenario_map):
     """
@@ -498,117 +261,76 @@ def update_scenario_names(f, scenario_map):
     return f
 
 
-def run_1pctco2():
-    scenarios = ["1pctCO2"]
-    # batch_start = cfg["batch_start"]
-    # batch_end = cfg["batch_end"]
-    # batch_size = batch_end - batch_start
+def compute_tcre():
+    '''
+    Look up TCRE (and a temperature-at-1000-GtC diagnostic) from the FaIR
+    calibration archive's own 1pctCO2 experiment, instead of re-running it.
+
+    Based on the script:
+        livestock_methane/script_00_tcre.py
+
+    The calibration archive ran a 1pctCO2 FaIR experiment once for all 1.6M
+    prior configs (Smith et al. 2024 calibration) and stored scalar
+    diagnostics in output/prior_runs/. TCRE is derived as TCR / 3670 GtCO2
+    (3670 Gt CO2 = 1000 Gt C, the standard cumulative CO2 at CO2 doubling,
+    year 70 of the 1%/yr experiment); this is the same approximation used by
+    IPCC AR6 (ignores per-config airborne-fraction variation).
+
+    Returns
+    -------
+    tcre : xarray.DataArray
+        Transient Climate Response to Cumulative CO2 Emissions, K/GtCO2,
+        dim 'config' (coords = the 841 constrained config IDs).
+    sat_1000gtc : xarray.DataArray
+        Temperature (K) at 1000 Gt C cumulative CO2 emissions in the
+        1pctCO2 experiment, same 'config' dim/coords as tcre. Useful as a
+        single-point illustration of the TCRE relationship (the calibration
+        archive only stores this scalar snapshot, not the full year-by-year
+        trajectory for the constrained ensemble).
+    '''
+    # 1000 Gt C of cumulative CO2 at CO2 doubling, converted to Gt CO2.
+    cumulative_co2_at_doubling = 3670.0  # Gt CO2
 
     df_configs = pd.read_csv(
-        f'{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/posteriors/'
-        'calibrated_constrained_parameters.csv',
+        fair_calibration_dir / 'output' / 'posteriors' / 'calibrated_constrained_parameters.csv',
         index_col=0,
     )
-    
-    species, properties = read_properties()
+    config_ids = df_configs.index
 
-    da_concentration = xr.load_dataarray(
-        f"{fair_calibration_dir}/output/fair-{fair_v}/v{cal_v}/{constraint_set}/"
-        "concentration/1pctCO2_concentration_1850-1990.nc"
+    # tcr.npy covers all 1.6M prior runs and is indexed directly by raw prior
+    # config ID, so the reweighted-pass run IDs (== config_ids) index into it
+    # directly.
+    tcr_all = np.load(fair_calibration_dir / 'output' / 'prior_runs' / 'tcr.npy')
+    run_ids = pd.read_csv(
+        fair_calibration_dir / 'output' / 'posteriors' / 'runids_rmse_reweighted_pass.csv',
+        header=None,
+    )[0].values
+    tcr_constrained = tcr_all[run_ids]
+    tcre = xr.DataArray(
+        tcr_constrained / cumulative_co2_at_doubling,
+        dims=['config'],
+        coords={'config': config_ids},
     )
 
-    f = FAIR()
-    f.define_time(1850, 1990, 1)
-    f.define_scenarios(scenarios)
-    species = ["CO2", "CH4", "N2O"]
-    properties = {
-        "CO2": {
-            "type": "co2",
-            "input_mode": "concentration",
-            "greenhouse_gas": True,
-            "aerosol_chemistry_from_emissions": False,
-            "aerosol_chemistry_from_concentration": False,
-        },
-        "CH4": {
-            "type": "ch4",
-            "input_mode": "concentration",
-            "greenhouse_gas": True,
-            "aerosol_chemistry_from_emissions": False,
-            "aerosol_chemistry_from_concentration": False,
-        },
-        "N2O": {
-            "type": "n2o",
-            "input_mode": "concentration",
-            "greenhouse_gas": True,
-            "aerosol_chemistry_from_emissions": False,
-            "aerosol_chemistry_from_concentration": False,
-        },
-    }
-    valid_all = df_configs.index
-    f.define_configs(valid_all)
-    f.define_species(species, properties)
-    f.allocate()
-
-    da = da_concentration.loc[dict(config="unspecified", scenario="1pctCO2")]
-    fe = da.expand_dims(dim=["scenario", "config"], axis=(1, 2))
-    f.concentration = fe.drop("config") * np.ones((1, 1, len(valid_all), 1))
-
-    # climate response
-    fill(
-        f.climate_configs["ocean_heat_capacity"],
-        np.array([df_configs["clim_c1"], df_configs["clim_c2"], df_configs["clim_c3"]]).T,
+    # temperature_1pctCO2_1000GtC.npy is only available for the RMSE-pass
+    # subset of priors, and is indexed by *position within*
+    # runids_rmse_pass.csv, not by raw config ID. Build a position lookup
+    # (rather than np.isin(...).nonzero(), used for printing only in the
+    # calibration's own check script) so the result stays ordered to match
+    # config_ids / the 'config' coordinate used everywhere else.
+    t1000_all = np.load(
+        fair_calibration_dir / 'output' / 'prior_runs' / 'temperature_1pctCO2_1000GtC.npy'
     )
-    fill(
-        f.climate_configs["ocean_heat_transfer"],
-        np.array([df_configs["clim_kappa1"], df_configs["clim_kappa2"], df_configs["clim_kappa3"]]).T,
+    rmse_pass_ids = np.loadtxt(
+        fair_calibration_dir / 'output' / 'posteriors' / 'runids_rmse_pass.csv',
+        dtype=int,
     )
-    fill(f.climate_configs["deep_ocean_efficacy"], df_configs["clim_epsilon"])
-    fill(f.climate_configs["gamma_autocorrelation"], df_configs["clim_gamma"])
-    fill(f.climate_configs["stochastic_run"], False)
-    fill(f.climate_configs["forcing_4co2"], df_configs["clim_F_4xCO2"])
-
-    # species level
-    f.fill_species_configs()
-
-    # carbon cycle
-    fill(f.species_configs["iirf_0"], df_configs["cc_r0"].values.squeeze(), specie="CO2")
-    fill(
-        f.species_configs["iirf_airborne"], df_configs["cc_rA"].values.squeeze(), specie="CO2"
-    )
-    fill(f.species_configs["iirf_uptake"], df_configs["cc_rU"].values.squeeze(), specie="CO2")
-    fill(
-        f.species_configs["iirf_temperature"],
-        df_configs["cc_rT"].values.squeeze(),
-        specie="CO2",
+    position_in_rmse_pass = {cid: pos for pos, cid in enumerate(rmse_pass_ids)}
+    idx = np.array([position_in_rmse_pass[cid] for cid in config_ids])
+    sat_1000gtc = xr.DataArray(
+        t1000_all[idx],
+        dims=['config'],
+        coords={'config': config_ids},
     )
 
-    # forcing scaling
-    fill(f.species_configs["forcing_scale"], df_configs["fscale_CO2"], specie="CO2")
-    fill(f.species_configs["forcing_scale"], df_configs["fscale_CH4"], specie="CH4")
-    fill(f.species_configs["forcing_scale"], df_configs["fscale_N2O"], specie="N2O")
-
-    # initial conditions
-    initialise(f.forcing, 0)
-    initialise(f.temperature, 0)
-    initialise(f.cumulative_emissions, 0)
-    initialise(f.airborne_emissions, 0)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        f.run(progress=False)
-
-    sat=f.temperature.sel(layer=0)
-    sat=sat.squeeze().drop_vars(['scenario','layer'])
-    
-    
-    cum_emi=f.cumulative_emissions.sel(specie='CO2')
-    cum_emi=cum_emi.squeeze().drop_vars(['scenario'])/3.67 # In Gt C
-    
-    tcre=sat.sel(timebounds=1920)/cum_emi.sel(timebounds=1920)*1000
-    tcr=sat.sel(timebounds=1920)
-
-    # Drop unnecessary dimensions
-    tcre=tcre.squeeze().drop_vars(['timebounds','specie'])
-    tcr=tcr.squeeze().drop_vars(['timebounds'])
-
-    return tcre,tcr, sat, cum_emi
+    return tcre, sat_1000gtc

@@ -8,6 +8,7 @@ Created on Tue Apr 15 09:58:11 2025
 
 import fair_tools
 import matplotlib.pyplot as pl
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -35,7 +36,7 @@ f_imo_1yr.forcing.loc[dict(specie='Volcanic', timebounds=slice(2020,2021))]=f_im
 
 
 # Calculate TCRE
-tcre,tcr, sat, cum_emi = fair_tools.run_1pctco2()
+tcre, sat_1000gtc = fair_tools.compute_tcre()
 
 
 
@@ -72,9 +73,9 @@ gtp_timescales=[20,50,100]
 gtp=pd.DataFrame(index=gtp_timescales, columns=['Continuous','1yr'])
 
 for gtp_timescale in gtp_timescales:
-    # Divide temperature response by TCRE and convert to Gt CO2 from 1000 Gt C
-    gtp.loc[gtp_timescale,'Continuous']=float((dsat_continuous.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config')*1e3*3.67)
-    gtp.loc[gtp_timescale,'1yr']=float((dsat_1yr.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config')*1e3*3.67)
+    # Divide temperature response (K) by TCRE (K/GtCO2) to get Gt CO2
+    gtp.loc[gtp_timescale,'Continuous']=float((dsat_continuous.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config'))
+    gtp.loc[gtp_timescale,'1yr']=float((dsat_1yr.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config'))
 
 
 
@@ -102,9 +103,8 @@ ax1[1].set_xlabel('Year')
 ax1[1].set_ylabel('°C')
 
 # === Add secondary y-axis for cumulative emissions ===
-# TCRE in °C per 1000 GtCO2 
- # extract scalar from xarray and convert from  °C/1000GtC to °C/Gt CO2
-tcre_mean = tcre.mean().item()*1e-3/3.67 
+# TCRE already in °C/GtCO2 — extract scalar from xarray
+tcre_mean = tcre.mean().item()
 
 # Forward: °C → GtCO2, Inverse: GtCO2 → °C
 def temp_to_emissions(temp):
@@ -139,8 +139,12 @@ ax2[1].legend()
 
 
 # %%  Figure to demonstrate TCRE
+# One point per config at the calibration's 1000 Gt C diagnostic (the
+# calibration archive only stores this scalar snapshot per config, not a
+# full cumulative-emissions/temperature trajectory for the constrained
+# ensemble — see fair_tools.compute_tcre).
 fig3, ax3= pl.subplots(1,1)
-ax3.plot(cum_emi,sat, color='tab:grey', linewidth=0.1)
+ax3.scatter(np.full_like(sat_1000gtc, 1000.0), sat_1000gtc, color='tab:grey', s=5, alpha=0.5)
 ax3.set_xlim(0,5000)
 ax3.set_xlabel('Cumulative CO$_2$ emissions (Gt C)')
 ax3.set_ylabel('Temperature change (°C)')

@@ -67,10 +67,10 @@ def get_sauna_emissions() -> Dict[str, float]:
     Return per-activity emissions for heating a wooden sauna, in FaIR units.
 
     Input values are defined in grams per sauna activity and converted to:
-        - CO2 : GtCO2
-        - BC  : Mt
-        - OC  : Mt
-        - VOC : Mt
+        - CO2 FFI : GtCO2
+        - BC      : Mt
+        - OC      : Mt
+        - VOC     : Mt
 
     Returns
     -------
@@ -83,7 +83,7 @@ def get_sauna_emissions() -> Dict[str, float]:
     voc_sauna_g = 290
 
     emissions = {
-        'CO2': g_to_gtco2(co2_sauna_g),
+        'CO2 FFI': g_to_gtco2(co2_sauna_g),
         'BC': g_to_mt(bc_sauna_g),
         'OC': g_to_mt(oc_sauna_g),
         'VOC': g_to_mt(voc_sauna_g),
@@ -97,10 +97,10 @@ def get_driving_emissions() -> Dict[str, float]:
     in FaIR units.
 
     Input values are grams per round trip, converted to:
-        - CO2 : GtCO2
-        - NOx : Mt
-        - BC  : Mt
-        - VOC : Mt
+        - CO2 FFI : GtCO2
+        - NOx     : Mt
+        - BC      : Mt
+        - VOC     : Mt
 
     Returns
     -------
@@ -113,7 +113,7 @@ def get_driving_emissions() -> Dict[str, float]:
     voc_drive_g = 75
 
     emissions = {
-        'CO2': g_to_gtco2(co2_drive_g),
+        'CO2 FFI': g_to_gtco2(co2_drive_g),
         'NOx': g_to_mt(nox_drive_g),
         'BC': g_to_mt(bc_drive_g),
         'VOC': g_to_mt(voc_drive_g),
