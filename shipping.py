@@ -10,6 +10,9 @@ import fair_tools
 import matplotlib.pyplot as pl
 import numpy as np
 import pandas as pd
+from matplotlib.legend_handler import HandlerBase
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from pathlib import Path
 
 year_end=2121
@@ -75,7 +78,7 @@ dsat_1yr=sat_1yr-sat_base
 
 # %%  Calculate GTP of imo regulation
 gtp_timescales=[20,50,100]
-gtp=pd.DataFrame(index=gtp_timescales, columns=['Continuous','1yr'])
+scenario_labels = ['Continuous', '1yr']
 
 # Per-config CO2-equivalent emissions (GtCO2) at each GTP timescale, keyed by
 # (scenario_label, gtp_timescale) -> DataArray with dim 'config'.
@@ -96,7 +99,35 @@ for gtp_timescale in gtp_timescales:
         dsat_at_year = dsat.sel(timebounds=year).squeeze('scenario', drop=True)
         exact_members[(label, gtp_timescale)] = dsat_at_year / tcre
         shortcut_members[(label, gtp_timescale)] = dsat_at_year / tcre_mean
-        gtp.loc[gtp_timescale, label] = float(exact_members[(label, gtp_timescale)].mean(dim='config'))
+
+# %%  Save GTP tables (mean + 66%/95% range across ensemble members) to CSV,
+# one file per method (exact = per-member TCRE, shortcut = ensemble-mean TCRE).
+outputpath = Path('output')
+outputpath.mkdir(exist_ok=True)
+
+gtp_quantile_levels = [0.025, 0.17, 0.83, 0.975]
+gtp_quantile_names = ['p2.5', 'p17', 'p83', 'p97.5']
+
+def build_gtp_table(members_dict):
+    table = pd.DataFrame(index=gtp_timescales)
+    for label in scenario_labels:
+        means = []
+        quantiles = []
+        for gtp_timescale in gtp_timescales:
+            vals = members_dict[(label, gtp_timescale)]
+            means.append(float(vals.mean(dim='config')))
+            quantiles.append(vals.quantile(gtp_quantile_levels, dim='config').values)
+        table[f'{label}_mean'] = means
+        quantiles = np.array(quantiles)
+        for i, name in enumerate(gtp_quantile_names):
+            table[f'{label}_{name}'] = quantiles[:, i]
+    return table
+
+gtp_exact = build_gtp_table(exact_members)
+gtp_shortcut = build_gtp_table(shortcut_members)
+
+gtp_exact.to_csv(outputpath / 'gtp_exact.csv')
+gtp_shortcut.to_csv(outputpath / 'gtp_shortcut.csv')
 
 
 
@@ -194,6 +225,119 @@ print(f'At {example_year}, Continuous scenario: exact={exact_val:.4g} GtCO2, '
       f'diff={100*(shortcut_val-exact_val)/exact_val:.2f}%, '
       f'per-member std: exact={exact_std:.4g}, shortcut={shortcut_std:.4g} GtCO2')
 
+# %%  Quantile uncertainty data for fig1b/fig1c below.
+# 66% range = 17th-83rd percentile, 95% range = 2.5th-97.5th percentile.
+# Mean lines reuse co2_equiv_*_exact / dsat_*.mean() computed above rather
+# than adding a 0.5 quantile, since mean (not median) is the requested
+# central estimate.
+quantile_levels = [0.025, 0.17, 0.83, 0.975]
+scenario_dsat = {'Continuous': dsat_continuous, '1yr': dsat_1yr}
+
+dsat_quantiles = {
+    label: da.quantile(quantile_levels, dim='config').squeeze('scenario', drop=True)
+    for label, da in scenario_dsat.items()
+}
+
+# Per-member exact: divide each member's own dT by that member's own TCRE
+# *before* taking quantiles, so the spread reflects the real TCRE/warming
+# correlation across members -- same approach as co2_equiv_*_exact above,
+# extended from a single mean value to a full quantile range.
+co2_equiv_exact_quantiles = {
+    label: (da / tcre).quantile(quantile_levels, dim='config').squeeze('scenario', drop=True)
+    for label, da in scenario_dsat.items()
+}
+
+# Order-of-magnitude sanity check at one timestep.
+dt_mean_check = float(dsat_continuous.mean(dim='config').sel(timebounds=example_year))
+dt_lo95_check = float(dsat_quantiles['Continuous'].sel(timebounds=example_year, quantile=0.025))
+dt_hi95_check = float(dsat_quantiles['Continuous'].sel(timebounds=example_year, quantile=0.975))
+print(f'At {example_year}, Continuous dT: mean={dt_mean_check:.4g} degC, '
+      f'95% range=[{dt_lo95_check:.4g}, {dt_hi95_check:.4g}] degC')
+
+co2_lo95_check = float(co2_equiv_exact_quantiles['Continuous'].sel(timebounds=example_year, quantile=0.025))
+co2_hi95_check = float(co2_equiv_exact_quantiles['Continuous'].sel(timebounds=example_year, quantile=0.975))
+print(f'At {example_year}, Continuous CO2-equiv (exact, per-member TCRE): '
+      f'mean={exact_val:.4g} GtCO2, 95% range=[{co2_lo95_check:.4g}, {co2_hi95_check:.4g}] GtCO2')
+
+unc_colors = {'Continuous': 'tab:blue', '1yr': 'tab:orange'}
+
+class HandlerUncertaintyBand(HandlerBase):
+    '''Draws a 95%-band rectangle (full height), a 66%-band rectangle nested
+    inside it (so the wider 95% shading stays visible as a margin, matching
+    the plot itself), and the mean line through the middle -- all as one
+    legend swatch.'''
+    def __init__(self, color, inner_frac=0.55, **kwargs):
+        self.color = color
+        self.inner_frac = inner_frac
+        super().__init__(**kwargs)
+
+    def create_artists(self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans):
+        outer = Rectangle((-xdescent, -ydescent), width, height,
+                           facecolor=self.color, alpha=0.15, transform=trans)
+        inner_height = height * self.inner_frac
+        inner = Rectangle((-xdescent, -ydescent + (height - inner_height) / 2), width, inner_height,
+                           facecolor=self.color, alpha=0.3, transform=trans)
+        line = Line2D([-xdescent, -xdescent + width], [-ydescent + height / 2] * 2,
+                      color=self.color, transform=trans)
+        return [outer, inner, line]
+
+def combined_uncertainty_legend(ax, labels):
+    '''One legend entry per scenario: 95%-band + 66%-band + mean line in a single swatch.'''
+    handles = [Line2D([], [], color=unc_colors[label]) for label in labels]
+    handler_map = {handle: HandlerUncertaintyBand(unc_colors[label])
+                    for handle, label in zip(handles, labels)}
+    ax.legend(handles, labels, handler_map=handler_map, handlelength=2.5, handleheight=1.5)
+
+# %%  Figure 1b: dT with 66%/95% quantile bands + secondary axis (shortcut TCRE)
+fig1b, ax1b = pl.subplots(1, 1, figsize=(6, 5))
+
+for label, dsat_mean_series in [('Continuous', dsat_continuous.mean(dim='config')),
+                                 ('1yr', dsat_1yr.mean(dim='config'))]:
+    q = dsat_quantiles[label]
+    color = unc_colors[label]
+    ax1b.fill_between(q.timebounds, q.sel(quantile=0.025), q.sel(quantile=0.975),
+                       color=color, alpha=0.15)
+    ax1b.fill_between(q.timebounds, q.sel(quantile=0.17), q.sel(quantile=0.83),
+                       color=color, alpha=0.3)
+    dsat_mean_series.plot(ax=ax1b, color=color)
+
+ax1b.set_xlim((2020, year_end))
+combined_uncertainty_legend(ax1b, ['Continuous', '1yr'])
+ax1b.set_title('Global mean surface temperature relative to Baseline\n(66%/95% range across ensemble members)')
+ax1b.set_xlabel('Year')
+ax1b.set_ylabel('°C')
+
+secax1b = ax1b.secondary_yaxis('right', functions=(temp_to_emissions, emissions_to_temp))
+secax1b.set_ylabel('Cumulative CO$_2$-warming-equivalent emissions (GtCO₂)\n(dT / mean(TCRE))')
+
+fig1b.savefig(figpath / 'temperature_uncertainty.png', dpi=150)
+
+# %%  Figure 1c: cumulative CO2-warming-equivalent emissions from per-member
+# TCRE (exact method), with 66%/95% quantile bands. No secondary axis here:
+# unlike fig1b's secondary axis (a single fixed dT->GtCO2 scale factor via
+# tcre_mean), the exact per-member relationship maps the same dT to a
+# different GtCO2 value depending on which member it came from, which isn't
+# representable as a static axis transform -- hence its own panel.
+fig1c, ax1c = pl.subplots(1, 1, figsize=(6, 5))
+
+for label, co2_mean_series in [('Continuous', co2_equiv_continuous_exact),
+                                ('1yr', co2_equiv_1yr_exact)]:
+    q = co2_equiv_exact_quantiles[label]
+    color = unc_colors[label]
+    ax1c.fill_between(q.timebounds, q.sel(quantile=0.025), q.sel(quantile=0.975),
+                       color=color, alpha=0.15)
+    ax1c.fill_between(q.timebounds, q.sel(quantile=0.17), q.sel(quantile=0.83),
+                       color=color, alpha=0.3)
+    co2_mean_series.plot(ax=ax1c, color=color)
+
+ax1c.set_xlim((2020, year_end))
+combined_uncertainty_legend(ax1c, ['Continuous', '1yr'])
+ax1c.set_title('Cumulative CO$_2$-warming-equivalent emissions of IMO regulation\n(per-member TCRE, 66%/95% range across ensemble members)')
+ax1c.set_xlabel('Year')
+ax1c.set_ylabel('Cumulative CO$_2$-warming-equivalent emissions (GtCO$_2$)')
+
+fig1c.savefig(figpath / 'co2_equivalent_uncertainty.png', dpi=150)
+
 fig4, ax4 = pl.subplots(1, 1, figsize=(6, 5))
 co2_equiv_continuous_exact.plot(ax=ax4, label='Continuous (exact)')
 co2_equiv_continuous_shortcut.plot(ax=ax4, label='Continuous (shortcut)', linestyle='--')
@@ -211,7 +355,6 @@ fig4.savefig(figpath / 'gtp_exact_vs_shortcut_timeseries.png', dpi=150)
 # overlays the exact and shortcut per-config distributions of CO2-equivalent
 # emissions, so the spread/location of the simplification's error is visible
 # directly, rather than just the difference of two already-averaged numbers.
-scenario_labels = ['Continuous', '1yr']
 fig5, ax5 = pl.subplots(len(scenario_labels), len(gtp_timescales), figsize=(12, 7), sharex='col')
 
 for row, label in enumerate(scenario_labels):
