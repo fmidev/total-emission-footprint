@@ -1,0 +1,12 @@
+name: total-emission-footprint
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - fair=2.2.4
+  - numpy=2.2.6
+  - pandas=2.2.2
+  - xarray=2024.7.0
+  - matplotlib=3.10.9
+  - netcdf4
+  - python-dotenv=1.0.1
