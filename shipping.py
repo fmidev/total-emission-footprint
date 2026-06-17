@@ -38,6 +38,11 @@ f_imo_1yr.forcing.loc[dict(specie='Volcanic', timebounds=slice(2020,2021))]=f_im
 # Calculate TCRE
 tcre, sat_1000gtc = fair_tools.compute_tcre()
 
+# TCRE already in °C/GtCO2 — extract scalar from xarray. Used as the
+# 'shortcut' TCRE value throughout (fig1's secondary axis, and the
+# exact-vs-shortcut diagnostics below).
+tcre_mean = tcre.mean().item()
+
 
 
 # f_imo_continuous.properties['Aerosol-radiation interactions']['input_mode']='forcing'
@@ -72,10 +77,26 @@ dsat_1yr=sat_1yr-sat_base
 gtp_timescales=[20,50,100]
 gtp=pd.DataFrame(index=gtp_timescales, columns=['Continuous','1yr'])
 
+# Per-config CO2-equivalent emissions (GtCO2) at each GTP timescale, keyed by
+# (scenario_label, gtp_timescale) -> DataArray with dim 'config'.
+# 'exact' divides each member's own temperature response by that member's own
+# TCRE. 'shortcut' keeps that same member's temperature response but divides
+# by the single ensemble-mean TCRE (tcre_mean) instead -- isolating exactly
+# the effect of replacing per-member TCRE with the ensemble mean.
+exact_members = {}
+shortcut_members = {}
+
 for gtp_timescale in gtp_timescales:
-    # Divide temperature response (K) by TCRE (K/GtCO2) to get Gt CO2
-    gtp.loc[gtp_timescale,'Continuous']=float((dsat_continuous.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config'))
-    gtp.loc[gtp_timescale,'1yr']=float((dsat_1yr.sel(timebounds=2020+gtp_timescale)/tcre).mean(dim='config'))
+    year = 2020 + gtp_timescale
+    for label, dsat in [('Continuous', dsat_continuous), ('1yr', dsat_1yr)]:
+        # Divide temperature response (K) by TCRE (K/GtCO2) to get Gt CO2.
+        # squeeze 'scenario' (size 1, single SSP) so the stored arrays are
+        # 1-D over 'config' only -- needed for hist()/scatter() below, which
+        # would otherwise treat each config as its own length-1 series.
+        dsat_at_year = dsat.sel(timebounds=year).squeeze('scenario', drop=True)
+        exact_members[(label, gtp_timescale)] = dsat_at_year / tcre
+        shortcut_members[(label, gtp_timescale)] = dsat_at_year / tcre_mean
+        gtp.loc[gtp_timescale, label] = float(exact_members[(label, gtp_timescale)].mean(dim='config'))
 
 
 
@@ -103,9 +124,6 @@ ax1[1].set_xlabel('Year')
 ax1[1].set_ylabel('°C')
 
 # === Add secondary y-axis for cumulative emissions ===
-# TCRE already in °C/GtCO2 — extract scalar from xarray
-tcre_mean = tcre.mean().item()
-
 # Forward: °C → GtCO2, Inverse: GtCO2 → °C
 def temp_to_emissions(temp):
     return temp / tcre_mean
@@ -165,13 +183,16 @@ co2_equiv_continuous_exact = (dsat_continuous / tcre).mean(dim='config')
 co2_equiv_1yr_shortcut = dsat_1yr.mean(dim='config') / tcre_mean
 co2_equiv_1yr_exact = (dsat_1yr / tcre).mean(dim='config')
 
-# Order-of-magnitude sanity check at one timestep
+# Order-of-magnitude sanity check at one timestep, including per-member spread
 example_year = 2070
 exact_val = float(co2_equiv_continuous_exact.sel(timebounds=example_year))
 shortcut_val = float(co2_equiv_continuous_shortcut.sel(timebounds=example_year))
+exact_std = float(exact_members[('Continuous', 50)].std(dim='config'))
+shortcut_std = float(shortcut_members[('Continuous', 50)].std(dim='config'))
 print(f'At {example_year}, Continuous scenario: exact={exact_val:.4g} GtCO2, '
       f'shortcut={shortcut_val:.4g} GtCO2, '
-      f'diff={100*(shortcut_val-exact_val)/exact_val:.2f}%')
+      f'diff={100*(shortcut_val-exact_val)/exact_val:.2f}%, '
+      f'per-member std: exact={exact_std:.4g}, shortcut={shortcut_std:.4g} GtCO2')
 
 fig4, ax4 = pl.subplots(1, 1, figsize=(6, 5))
 co2_equiv_continuous_exact.plot(ax=ax4, label='Continuous (exact)')
@@ -185,25 +206,57 @@ ax4.set_xlabel('Year')
 ax4.set_ylabel('Cumulative CO$_2$-equivalent emissions (GtCO$_2$)')
 fig4.savefig(figpath / 'gtp_exact_vs_shortcut_timeseries.png', dpi=150)
 
-# %%  Scatter: shortcut vs exact CO2-equivalent emissions, one point per year
-fig5, ax5 = pl.subplots(1, 1, figsize=(5, 5))
-sel_years = slice(2020, year_end)
-ax5.scatter(co2_equiv_continuous_shortcut.sel(timebounds=sel_years),
-            co2_equiv_continuous_exact.sel(timebounds=sel_years),
-            s=8, alpha=0.5, label='Continuous')
-ax5.scatter(co2_equiv_1yr_shortcut.sel(timebounds=sel_years),
-            co2_equiv_1yr_exact.sel(timebounds=sel_years),
-            s=8, alpha=0.5, label='1-year')
+# %%  Per-member distributions: exact (own TCRE) vs shortcut (mean TCRE)
+# Small multiples: rows = scenario, columns = GTP timescale. Each panel
+# overlays the exact and shortcut per-config distributions of CO2-equivalent
+# emissions, so the spread/location of the simplification's error is visible
+# directly, rather than just the difference of two already-averaged numbers.
+scenario_labels = ['Continuous', '1yr']
+fig5, ax5 = pl.subplots(len(scenario_labels), len(gtp_timescales), figsize=(12, 7), sharex='col')
 
-lo = min(ax5.get_xlim()[0], ax5.get_ylim()[0])
-hi = max(ax5.get_xlim()[1], ax5.get_ylim()[1])
-ax5.plot([lo, hi], [lo, hi], 'k--', lw=1, label='1:1')
-ax5.set_xlim((lo, hi))
-ax5.set_ylim((lo, hi))
-ax5.set_aspect('equal')
-ax5.set_xlabel('Shortcut: mean(ΔT) / mean(TCRE)  (GtCO$_2$)')
-ax5.set_ylabel('Exact: mean(ΔT / TCRE)  (GtCO$_2$)')
-ax5.set_title('CO$_2$-equivalent emissions:\nshortcut vs exact per-member calculation')
-ax5.legend()
-fig5.savefig(figpath / 'gtp_shortcut_vs_exact_scatter.png', dpi=150)
+for row, label in enumerate(scenario_labels):
+    for col, gtp_timescale in enumerate(gtp_timescales):
+        ax = ax5[row, col]
+        exact_vals = exact_members[(label, gtp_timescale)].values
+        shortcut_vals = shortcut_members[(label, gtp_timescale)].values
+        ax.hist(exact_vals, bins=40, alpha=0.5, label='exact')
+        ax.hist(shortcut_vals, bins=40, alpha=0.5, label='shortcut')
+        ax.axvline(exact_vals.mean(), color='tab:blue', linestyle='--', lw=1)
+        ax.axvline(shortcut_vals.mean(), color='tab:orange', linestyle='--', lw=1)
+        ax.set_title(f'{label}, {gtp_timescale} yr')
+        if row == len(scenario_labels) - 1:
+            ax.set_xlabel('GtCO$_2$')
+        if col == 0:
+            ax.set_ylabel('Count')
+
+ax5[0, 0].legend()
+fig5.suptitle('Per-member CO$_2$-equivalent emissions:\nexact (own TCRE) vs shortcut (mean TCRE)')
+fig5.tight_layout()
+fig5.savefig(figpath / 'gtp_exact_vs_shortcut_hist.png', dpi=150)
+
+# %%  Per-member paired scatter: exact vs shortcut (same config, same panel layout)
+fig6, ax6 = pl.subplots(len(scenario_labels), len(gtp_timescales), figsize=(12, 7))
+
+for row, label in enumerate(scenario_labels):
+    for col, gtp_timescale in enumerate(gtp_timescales):
+        ax = ax6[row, col]
+        exact_vals = exact_members[(label, gtp_timescale)].values
+        shortcut_vals = shortcut_members[(label, gtp_timescale)].values
+        ax.scatter(shortcut_vals, exact_vals, s=5, alpha=0.4)
+
+        lo = min(shortcut_vals.min(), exact_vals.min())
+        hi = max(shortcut_vals.max(), exact_vals.max())
+        ax.plot([lo, hi], [lo, hi], 'k--', lw=1)
+        ax.set_xlim((lo, hi))
+        ax.set_ylim((lo, hi))
+        ax.set_aspect('equal')
+        ax.set_title(f'{label}, {gtp_timescale} yr')
+        if row == len(scenario_labels) - 1:
+            ax.set_xlabel('Shortcut (GtCO$_2$)')
+        if col == 0:
+            ax.set_ylabel('Exact (GtCO$_2$)')
+
+fig6.suptitle('Per-member CO$_2$-equivalent emissions:\nshortcut vs exact, paired by ensemble member')
+fig6.tight_layout()
+fig6.savefig(figpath / 'gtp_exact_vs_shortcut_scatter.png', dpi=150)
 
