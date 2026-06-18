@@ -15,7 +15,9 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from pathlib import Path
 
-year_end=2121
+year_end=2150
+
+show_exact_tcre_lines=False
 
 figpath=Path('figures')
 
@@ -78,7 +80,7 @@ dsat_1yr=sat_1yr-sat_base
 
 # %%  Calculate GTP of imo regulation
 gtp_timescales=[20,50,100]
-scenario_labels = ['Continuous', '1yr']
+scenario_labels = ['Continuous', '1-yr pulse']
 
 # Per-config CO2-equivalent emissions (GtCO2) at each GTP timescale, keyed by
 # (scenario_label, gtp_timescale) -> DataArray with dim 'config'.
@@ -91,7 +93,7 @@ shortcut_members = {}
 
 for gtp_timescale in gtp_timescales:
     year = 2020 + gtp_timescale
-    for label, dsat in [('Continuous', dsat_continuous), ('1yr', dsat_1yr)]:
+    for label, dsat in [('Continuous', dsat_continuous), ('1-yr pulse', dsat_1yr)]:
         # Divide temperature response (K) by TCRE (K/GtCO2) to get Gt CO2.
         # squeeze 'scenario' (size 1, single SSP) so the stored arrays are
         # 1-D over 'config' only -- needed for hist()/scatter() below, which
@@ -231,7 +233,7 @@ print(f'At {example_year}, Continuous scenario: exact={exact_val:.4g} GtCO2, '
 # than adding a 0.5 quantile, since mean (not median) is the requested
 # central estimate.
 quantile_levels = [0.025, 0.17, 0.83, 0.975]
-scenario_dsat = {'Continuous': dsat_continuous, '1yr': dsat_1yr}
+scenario_dsat = {'Continuous': dsat_continuous, '1-yr pulse': dsat_1yr}
 
 dsat_quantiles = {
     label: da.quantile(quantile_levels, dim='config').squeeze('scenario', drop=True)
@@ -259,7 +261,7 @@ co2_hi95_check = float(co2_equiv_exact_quantiles['Continuous'].sel(timebounds=ex
 print(f'At {example_year}, Continuous CO2-equiv (exact, per-member TCRE): '
       f'mean={exact_val:.4g} GtCO2, 95% range=[{co2_lo95_check:.4g}, {co2_hi95_check:.4g}] GtCO2')
 
-unc_colors = {'Continuous': 'tab:blue', '1yr': 'tab:orange'}
+unc_colors = {'Continuous': 'tab:blue', '1-yr pulse': 'tab:orange'}
 
 class HandlerUncertaintyBand(HandlerBase):
     '''Draws a 95%-band rectangle (full height), a 66%-band rectangle nested
@@ -281,18 +283,45 @@ class HandlerUncertaintyBand(HandlerBase):
                       color=self.color, transform=trans)
         return [outer, inner, line]
 
-def combined_uncertainty_legend(ax, labels):
-    '''One legend entry per scenario: 95%-band + 66%-band + mean line in a single swatch.'''
+def combined_uncertainty_legend(ax, labels, extra_handles=None, extra_labels=None):
+    '''One legend entry per scenario: 95%-band + 66%-band + mean line in a single swatch.
+    extra_handles/extra_labels let callers add plain Line2D entries (e.g. an
+    exact-TCRE comparison line) alongside the swatch entries.'''
     handles = [Line2D([], [], color=unc_colors[label]) for label in labels]
     handler_map = {handle: HandlerUncertaintyBand(unc_colors[label])
                     for handle, label in zip(handles, labels)}
+    if extra_handles:
+        handles = handles + list(extra_handles)
+        labels = labels + list(extra_labels)
     ax.legend(handles, labels, handler_map=handler_map, handlelength=2.5, handleheight=1.5)
+
+def add_gtp_crossing_lines(ax, scenario_mean_series, gtp_timescales, colors, base_year=2020):
+    '''Gray vertical dropline at each GTP year + a color-matched horizontal
+    line per scenario from where it crosses that scenario's mean curve to
+    the right axis edge -- shows how the GTP value at each timescale is
+    read off the plot. Captures/restores xlim & ylim so the extra artists
+    don't trigger autoscale expansion.'''
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    for gtp_timescale in gtp_timescales:
+        year = base_year + gtp_timescale
+        crossing_ys = []
+        for label, series in scenario_mean_series.items():
+            y_val = float(series.sel(timebounds=year))
+            crossing_ys.append(y_val)
+            ax.hlines(y_val, year, xlim[1], color=colors[label], linestyle=':', linewidth=0.8, zorder=4)
+            ax.plot(year, y_val, 'o', color=colors[label], ms=4, zorder=5)
+        line_top = max(crossing_ys)
+        ax.vlines(year, ylim[0], line_top, color='gray', linestyle=':', linewidth=0.8, zorder=3)
+        ax.text(year, line_top + 0.03 * (ylim[1] - ylim[0]), f'{gtp_timescale} yr',
+                color='gray', ha='center', va='bottom', fontsize=8, zorder=3)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
 
 # %%  Figure 1b: dT with 66%/95% quantile bands + secondary axis (shortcut TCRE)
 fig1b, ax1b = pl.subplots(1, 1, figsize=(6, 5))
 
 for label, dsat_mean_series in [('Continuous', dsat_continuous.mean(dim='config')),
-                                 ('1yr', dsat_1yr.mean(dim='config'))]:
+                                 ('1-yr pulse', dsat_1yr.mean(dim='config'))]:
     q = dsat_quantiles[label]
     color = unc_colors[label]
     ax1b.fill_between(q.timebounds, q.sel(quantile=0.025), q.sel(quantile=0.975),
@@ -301,11 +330,36 @@ for label, dsat_mean_series in [('Continuous', dsat_continuous.mean(dim='config'
                        color=color, alpha=0.3)
     dsat_mean_series.plot(ax=ax1b, color=color)
 
+extra_handles, extra_labels = [], []
+if show_exact_tcre_lines:
+    # Overlay the exact-TCRE (per-member) cumulative CO2-equivalent emissions,
+    # converted back to a temperature-equivalent value via the shortcut
+    # tcre_mean so it lands correctly on this dual-axis plot: since secax1b's
+    # scale is dT = GtCO2 * tcre_mean, plotting at that converted dT means the
+    # secondary axis correctly reads back the original exact-TCRE GtCO2 value.
+    # Same color as each scenario's existing line, dashed to mark it as the
+    # alternative (exact, not shortcut) method. '1-yr pulse' is the single-year pulse
+    # perturbation, so this also gives the exact-TCRE comparison for the pulse.
+    exact_tcre_line, = emissions_to_temp(co2_equiv_continuous_exact).plot(
+        ax=ax1b, color=unc_colors['Continuous'], linestyle='--')
+    exact_tcre_line_1yr, = emissions_to_temp(co2_equiv_1yr_exact).plot(
+        ax=ax1b, color=unc_colors['1-yr pulse'], linestyle='--')
+    extra_handles = [exact_tcre_line, exact_tcre_line_1yr]
+    extra_labels = ['Continuous (exact TCRE)', '1-yr pulse (exact TCRE)']
+
 ax1b.set_xlim((2020, year_end))
-combined_uncertainty_legend(ax1b, ['Continuous', '1yr'])
-ax1b.set_title('Global mean surface temperature relative to Baseline\n(66%/95% range across ensemble members)')
+add_gtp_crossing_lines(
+    ax1b,
+    {'Continuous': dsat_continuous.mean(dim='config'), '1-yr pulse': dsat_1yr.mean(dim='config')},
+    gtp_timescales, unc_colors,
+)
+combined_uncertainty_legend(
+    ax1b, ['Continuous', '1-yr pulse'],
+    extra_handles=extra_handles, extra_labels=extra_labels,
+)
+ax1b.set_title('')
 ax1b.set_xlabel('Year')
-ax1b.set_ylabel('°C')
+ax1b.set_ylabel('Temperature response (°C)')
 
 secax1b = ax1b.secondary_yaxis('right', functions=(temp_to_emissions, emissions_to_temp))
 secax1b.set_ylabel('Cumulative CO$_2$-warming-equivalent emissions (GtCO₂)\n(dT / mean(TCRE))')
@@ -321,7 +375,7 @@ fig1b.savefig(figpath / 'temperature_uncertainty.png', dpi=150)
 fig1c, ax1c = pl.subplots(1, 1, figsize=(6, 5))
 
 for label, co2_mean_series in [('Continuous', co2_equiv_continuous_exact),
-                                ('1yr', co2_equiv_1yr_exact)]:
+                                ('1-yr pulse', co2_equiv_1yr_exact)]:
     q = co2_equiv_exact_quantiles[label]
     color = unc_colors[label]
     ax1c.fill_between(q.timebounds, q.sel(quantile=0.025), q.sel(quantile=0.975),
@@ -331,8 +385,13 @@ for label, co2_mean_series in [('Continuous', co2_equiv_continuous_exact),
     co2_mean_series.plot(ax=ax1c, color=color)
 
 ax1c.set_xlim((2020, year_end))
-combined_uncertainty_legend(ax1c, ['Continuous', '1yr'])
-ax1c.set_title('Cumulative CO$_2$-warming-equivalent emissions of IMO regulation\n(per-member TCRE, 66%/95% range across ensemble members)')
+add_gtp_crossing_lines(
+    ax1c,
+    {'Continuous': co2_equiv_continuous_exact, '1-yr pulse': co2_equiv_1yr_exact},
+    gtp_timescales, unc_colors,
+)
+combined_uncertainty_legend(ax1c, ['Continuous', '1-yr pulse'])
+ax1c.set_title('')
 ax1c.set_xlabel('Year')
 ax1c.set_ylabel('Cumulative CO$_2$-warming-equivalent emissions (GtCO$_2$)')
 
