@@ -10,6 +10,7 @@ import fair_tools
 import matplotlib.pyplot as pl
 import numpy as np
 import pandas as pd
+import xarray as xr
 from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
@@ -78,9 +79,24 @@ dsat_continuous=sat_continuous-sat_base
 dsat_gettelman=sat_gettelman-sat_base
 dsat_1yr=sat_1yr-sat_base
 
+scenario_labels = ['Continuous', '1-yr pulse']
+
+# %%  Save per-member layer-0 temperature anomaly (degC) for both scenarios
+# to netCDF, dims (timebounds, config, scenario) -- so things like the
+# ensemble-mean peak dT can be read off without re-running the full ensemble.
+outputpath = Path('output')
+outputpath.mkdir(exist_ok=True)
+
+dsat_combined = xr.concat(
+    [dsat_continuous.squeeze('scenario', drop=True),
+     dsat_1yr.squeeze('scenario', drop=True)],
+    dim=pd.Index(scenario_labels, name='scenario'),
+).transpose('timebounds', 'config', 'scenario')
+dsat_combined.name = 'dsat'
+dsat_combined.to_netcdf(outputpath / 'dsat_layer0.nc')
+
 # %%  Calculate GTP of imo regulation
 gtp_timescales=[20,50,100]
-scenario_labels = ['Continuous', '1-yr pulse']
 
 # Per-config CO2-equivalent emissions (GtCO2) at each GTP timescale, keyed by
 # (scenario_label, gtp_timescale) -> DataArray with dim 'config'.
@@ -88,8 +104,11 @@ scenario_labels = ['Continuous', '1-yr pulse']
 # TCRE. 'shortcut' keeps that same member's temperature response but divides
 # by the single ensemble-mean TCRE (tcre_mean) instead -- isolating exactly
 # the effect of replacing per-member TCRE with the ensemble mean.
+# 'temperature' keeps the raw per-member dT (degC), with no TCRE division --
+# this is method-independent, so there's no exact/shortcut split for it.
 exact_members = {}
 shortcut_members = {}
+temperature_members = {}
 
 for gtp_timescale in gtp_timescales:
     year = 2020 + gtp_timescale
@@ -101,12 +120,10 @@ for gtp_timescale in gtp_timescales:
         dsat_at_year = dsat.sel(timebounds=year).squeeze('scenario', drop=True)
         exact_members[(label, gtp_timescale)] = dsat_at_year / tcre
         shortcut_members[(label, gtp_timescale)] = dsat_at_year / tcre_mean
+        temperature_members[(label, gtp_timescale)] = dsat_at_year
 
 # %%  Save GTP tables (mean + 66%/95% range across ensemble members) to CSV,
 # one file per method (exact = per-member TCRE, shortcut = ensemble-mean TCRE).
-outputpath = Path('output')
-outputpath.mkdir(exist_ok=True)
-
 gtp_quantile_levels = [0.025, 0.17, 0.83, 0.975]
 gtp_quantile_names = ['p2.5', 'p17', 'p83', 'p97.5']
 
@@ -127,9 +144,11 @@ def build_gtp_table(members_dict):
 
 gtp_exact = build_gtp_table(exact_members)
 gtp_shortcut = build_gtp_table(shortcut_members)
+gtp_temperature = build_gtp_table(temperature_members)
 
 gtp_exact.to_csv(outputpath / 'gtp_exact.csv')
 gtp_shortcut.to_csv(outputpath / 'gtp_shortcut.csv')
+gtp_temperature.to_csv(outputpath / 'gtp_temperature.csv')
 
 
 
